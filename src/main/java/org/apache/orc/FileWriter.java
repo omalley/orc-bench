@@ -134,7 +134,7 @@ public class FileWriter {
                                ) throws IOException {
     long start = System.currentTimeMillis();
     Writer writer = OrcFile.createWriter(fs, path, conf, oi, 67108864,
-        CompressionKind.ZLIB, 262144,10000);
+        CompressionKind.ZLIB, /* 262144 */ 32 * 1024,10000);
     BigRow row = new BigRow();
     for (int i = 0; i < numberOfRows; i++) {
       row.set(i, i + "_" + file + "_This is a medium sized field value_", file);
