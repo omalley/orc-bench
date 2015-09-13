@@ -310,7 +310,10 @@ class WriterImpl implements Writer, MemoryManager.Callback {
                 limit);
     }
     if (size > limit) {
+      System.out.println("*** FLUSH ***");
       flushStripe();
+      estimateStripeSize();
+      System.out.println("*** END FLUSH ***");
       return true;
     }
     return false;
@@ -785,7 +788,9 @@ class WriterImpl implements Writer, MemoryManager.Callback {
     long estimateMemory() {
       long result = 0;
       for (TreeWriter child: childrenWriters) {
-        result += child.estimateMemory();
+        long size = child.estimateMemory();
+        System.out.println("Tree writer " + child.id + " = " + size);
+        result += size;
       }
       return result;
     }
@@ -2240,7 +2245,9 @@ class WriterImpl implements Writer, MemoryManager.Callback {
   private long estimateStripeSize() {
     long result = 0;
     for(BufferedStream stream: streams.values()) {
-      result += stream.getBufferSize();
+      long size = stream.getBufferSize();
+      System.out.println(stream + " size = " + size);
+      result += size;
     }
     result += treeWriter.estimateMemory();
     return result;

@@ -282,7 +282,7 @@ class RecordReaderImpl implements RecordReader {
 
     firstRow = skippedRows;
     totalRowCount = rows;
-    reader = createTreeReader(path, 0, types, included, conf);
+    reader = createTreeReader(path, 0, types, included, conf, null);
     indexes = new OrcProto.RowIndex[types.size()];
     rowIndexStride = strideRate;
     advanceToNextRow(0L);
@@ -1292,66 +1292,6 @@ class RecordReaderImpl implements RecordReader {
     }
   }
 
-  /**
-   * A tree reader that will read string columns. At the start of the
-   * stripe, it creates an internal reader based on whether a direct or
-   * dictionary encoding was used.
-   */
-  private static class StringTreeReader extends TreeReader {
-    private TreeReader reader;
-
-    StringTreeReader(Path path, int columnId, Configuration conf) {
-      super(path, columnId, conf);
-    }
-
-    @Override
-    void checkEncoding(OrcProto.ColumnEncoding encoding) throws IOException {
-      reader.checkEncoding(encoding);
-    }
-
-    @Override
-    void startStripe(Map<StreamName, InStream> streams,
-                     List<OrcProto.ColumnEncoding> encodings
-                    ) throws IOException {
-      // For each stripe, checks the encoding and initializes the appropriate
-      // reader
-      switch (encodings.get(columnId).getKind()) {
-        case DIRECT:
-        case DIRECT_V2:
-          reader = new StringDirectTreeReader(path, columnId, conf);
-          break;
-        case DICTIONARY:
-        case DICTIONARY_V2:
-          reader = new StringDictionaryTreeReader(path, columnId, conf);
-          break;
-        default:
-          throw new IllegalArgumentException("Unsupported encoding " +
-              encodings.get(columnId).getKind());
-      }
-      reader.startStripe(streams, encodings);
-    }
-
-    @Override
-    void seek(PositionProvider[] index) throws IOException {
-      reader.seek(index);
-    }
-
-    @Override
-    Object next(Object previous) throws IOException {
-      return reader.next(previous);
-    }
-
-    @Override
-    Object nextVector(Object previousVector, long batchSize) throws IOException {
-      return reader.nextVector(previousVector, batchSize);
-    }
-
-    @Override
-    void skipRows(long items) throws IOException {
-      reader.skipRows(items);
-    }
-  }
-
   // This class collects together very similar methods for reading an ORC vector of byte arrays and
   // creating the BytesColumnVector.
   //
@@ -1607,7 +1547,9 @@ class RecordReaderImpl implements RecordReader {
           result = (Text) previous;
         }
         int offset = dictionaryOffsets[entry];
-        int length = getDictionaryEntryLength(entry, offset);
+        int length = ((entry < dictionaryOffsets.length - 1) ?
+            dictionaryOffsets[entry + 1] : dictionaryBuffer.size()) - offset;
+
         // If the column is just empty strings, the size will be zero,
         // so the buffer will be null, in that case just return result
         // as it will default to empty
@@ -1649,8 +1591,10 @@ class RecordReaderImpl implements RecordReader {
           // and set strings one by one
           for (int i = 0; i < batchSize; i++) {
             if (!scratchlcv.isNull[i]) {
-              offset = dictionaryOffsets[(int) scratchlcv.vector[i]];
-              length = getDictionaryEntryLength((int) scratchlcv.vector[i], offset);
+              int row = (int) scratchlcv.vector[i];
+              offset = dictionaryOffsets[row];
+              length = ((row < dictionaryOffsets.length - 1) ?
+                  dictionaryOffsets[row + 1] : dictionaryBuffer.size()) - offset;
               result.setRef(i, dictionaryBufferInBytesCache, offset, length);
             } else {
               // If the value is null then set offset and length to zero (null string)
@@ -1661,8 +1605,10 @@ class RecordReaderImpl implements RecordReader {
           // If the value is repeating then just set the first value in the
           // vector and set the isRepeating flag to true. No need to iterate thru and
           // set all the elements to the same value
-          offset = dictionaryOffsets[(int) scratchlcv.vector[0]];
-          length = getDictionaryEntryLength((int) scratchlcv.vector[0], offset);
+          int row = (int) scratchlcv.vector[0];
+          offset = dictionaryOffsets[row];
+          length = ((row < dictionaryOffsets.length - 1) ?
+              dictionaryOffsets[row + 1] : dictionaryBuffer.size()) - offset;
           result.setRef(0, dictionaryBufferInBytesCache, offset, length);
         }
         result.isRepeating = scratchlcv.isRepeating;
@@ -1676,28 +1622,16 @@ class RecordReaderImpl implements RecordReader {
       return result;
     }
 
-    int getDictionaryEntryLength(int entry, int offset) {
-      int length = 0;
-      // if it isn't the last entry, subtract the offsets otherwise use
-      // the buffer length.
-      if (entry < dictionaryOffsets.length - 1) {
-        length = dictionaryOffsets[entry + 1] - offset;
-      } else {
-        length = dictionaryBuffer.size() - offset;
-      }
-      return length;
-    }
-
     @Override
     void skipRows(long items) throws IOException {
       reader.skip(countNonNulls(items));
     }
   }
 
-  private static class CharTreeReader extends StringTreeReader {
+  private static class CharDirectTreeReader extends StringDirectTreeReader {
     int maxLength;
 
-    CharTreeReader(Path path, int columnId, int maxLength, Configuration conf) {
+    CharDirectTreeReader(Path path, int columnId, int maxLength, Configuration conf) {
       super(path, columnId, conf);
       this.maxLength = maxLength;
     }
@@ -1720,48 +1654,41 @@ class RecordReaderImpl implements RecordReader {
       result.enforceMaxLength(maxLength);
       return result;
     }
+  }
+
+  private static class CharDictionaryTreeReader extends StringDictionaryTreeReader {
+    int maxLength;
+
+    CharDictionaryTreeReader(Path path, int columnId, int maxLength, Configuration conf) {
+      super(path, columnId, conf);
+      this.maxLength = maxLength;
+    }
 
     @Override
-    Object nextVector(Object previousVector, long batchSize) throws IOException {
-      // Get the vector of strings from StringTreeReader, then make a 2nd pass to
-      // adjust down the length (right trim and truncate) if necessary.
-      BytesColumnVector result = (BytesColumnVector) super.nextVector(previousVector, batchSize);
-
-      int adjustedDownLen;
-      if (result.isRepeating) {
-        if (result.noNulls || !result.isNull[0]) {
-          adjustedDownLen = StringExpr.rightTrimAndTruncate(result.vector[0], result.start[0], result.length[0], maxLength);
-          if (adjustedDownLen < result.length[0]) {
-            result.setRef(0, result.vector[0], result.start[0], adjustedDownLen);
-          }
-        }
+    Object next(Object previous) throws IOException {
+      HiveCharWritable result = null;
+      if (previous == null) {
+        result = new HiveCharWritable();
       } else {
-        if (result.noNulls){ 
-          for (int i = 0; i < batchSize; i++) {
-            adjustedDownLen = StringExpr.rightTrimAndTruncate(result.vector[i], result.start[i], result.length[i], maxLength);
-            if (adjustedDownLen < result.length[i]) {
-              result.setRef(i, result.vector[i], result.start[i], adjustedDownLen);
-            }
-          }
-        } else {
-          for (int i = 0; i < batchSize; i++) {
-            if (!result.isNull[i]) {
-              adjustedDownLen = StringExpr.rightTrimAndTruncate(result.vector[i], result.start[i], result.length[i], maxLength);
-              if (adjustedDownLen < result.length[i]) {
-                result.setRef(i, result.vector[i], result.start[i], adjustedDownLen);
-              }
-            }
-          }
-        }
+        result = (HiveCharWritable) previous;
       }
+      // Use the string reader implementation to populate the internal Text value
+      Object textVal = super.next(result.getTextValue());
+      if (textVal == null) {
+        return null;
+      }
+      // result should now hold the value that was read in.
+      // enforce char length
+      result.enforceMaxLength(maxLength);
       return result;
     }
   }
 
-  private static class VarcharTreeReader extends StringTreeReader {
+  private static class VarcharDirectTreeReader extends StringDirectTreeReader {
     int maxLength;
 
-    VarcharTreeReader(Path path, int columnId, int maxLength, Configuration conf) {
+    VarcharDirectTreeReader(Path path, int columnId, int maxLength,
+                            Configuration conf) {
       super(path, columnId, conf);
       this.maxLength = maxLength;
     }
@@ -1784,61 +1711,90 @@ class RecordReaderImpl implements RecordReader {
       result.enforceMaxLength(maxLength);
       return result;
     }
+  }
+
+  private static class VarcharDictionaryTreeReader extends StringDictionaryTreeReader {
+    int maxLength;
+
+    VarcharDictionaryTreeReader(Path path, int columnId, int maxLength,
+                            Configuration conf) {
+      super(path, columnId, conf);
+      this.maxLength = maxLength;
+    }
 
     @Override
-    Object nextVector(Object previousVector, long batchSize) throws IOException {
-      // Get the vector of strings from StringTreeReader, then make a 2nd pass to
-      // adjust down the length (truncate) if necessary.
-      BytesColumnVector result = (BytesColumnVector) super.nextVector(previousVector, batchSize);
-
-      int adjustedDownLen;
-      if (result.isRepeating) {
-      if (result.noNulls || !result.isNull[0]) {
-          adjustedDownLen = StringExpr.truncate(result.vector[0], result.start[0], result.length[0], maxLength);
-          if (adjustedDownLen < result.length[0]) {
-            result.setRef(0, result.vector[0], result.start[0], adjustedDownLen);
-          }
-        }
+    Object next(Object previous) throws IOException {
+      HiveVarcharWritable result = null;
+      if (previous == null) {
+        result = new HiveVarcharWritable();
       } else {
-        if (result.noNulls){ 
-          for (int i = 0; i < batchSize; i++) {
-            adjustedDownLen = StringExpr.truncate(result.vector[i], result.start[i], result.length[i], maxLength);
-            if (adjustedDownLen < result.length[i]) {
-              result.setRef(i, result.vector[i], result.start[i], adjustedDownLen);
-            }
-          }
-        } else {
-          for (int i = 0; i < batchSize; i++) {
-            if (!result.isNull[i]) {
-              adjustedDownLen = StringExpr.truncate(result.vector[i], result.start[i], result.length[i], maxLength);
-              if (adjustedDownLen < result.length[i]) {
-                result.setRef(i, result.vector[i], result.start[i], adjustedDownLen);
-              }
-            }
-          }
-        }
+        result = (HiveVarcharWritable) previous;
       }
+      // Use the string reader implementation to populate the internal Text value
+      Object textVal = super.next(result.getTextValue());
+      if (textVal == null) {
+        return null;
+      }
+      // result should now hold the value that was read in.
+      // enforce varchar length
+      result.enforceMaxLength(maxLength);
       return result;
     }
   }
 
-  private static class StructTreeReader extends TreeReader {
-    private final TreeReader[] fields;
+  private abstract static class CompoundTreeReader extends TreeReader {
+    protected final TreeReader[] fields;
+    private final int[] childIds;
+    private final List<OrcProto.Type> types;
+    private final boolean[] included;
+    private final OrcProto.ColumnEncoding[] previousEncoding;
+
+    CompoundTreeReader(Path path, int columnId,
+                       Configuration conf,
+                       List<OrcProto.Type> types,
+                       boolean[] included) throws IOException {
+      super(path, columnId, conf);
+      this.types = types;
+      this.included = included;
+      OrcProto.Type type = types.get(columnId);
+      int numChildren = type.getSubtypesCount();
+      fields = new TreeReader[numChildren];
+      childIds = new int[numChildren];
+      for(int i=0; i < childIds.length; ++i) {
+        childIds[i] = type.getSubtypes(i);
+      }
+      previousEncoding = new OrcProto.ColumnEncoding[numChildren];
+    }
+
+    void startStripe(Map<StreamName, InStream> streams,
+                     List<OrcProto.ColumnEncoding> encodings
+                     ) throws IOException {
+      super.startStripe(streams, encodings);
+      for(int i=0; i < fields.length; ++i) {
+        int childId = childIds[i];
+        if (included == null || included[childId]) {
+          OrcProto.ColumnEncoding newEncoding = encodings.get(childId);
+          if (previousEncoding[i] != newEncoding) {
+            fields[i] = createTreeReader(path, childId, types, included,
+                conf, newEncoding);
+          }
+          fields[i].startStripe(streams, encodings);
+        }
+      }
+    }
+  }
+
+  private static class StructTreeReader extends CompoundTreeReader {
     private final String[] fieldNames;
 
     StructTreeReader(Path path, int columnId,
                      List<OrcProto.Type> types,
                      boolean[] included, Configuration conf) throws IOException {
-      super(path, columnId, conf);
+      super(path, columnId, conf, types, included);
       OrcProto.Type type = types.get(columnId);
-      int fieldCount = type.getFieldNamesCount();
-      this.fields = new TreeReader[fieldCount];
-      this.fieldNames = new String[fieldCount];
-      for(int i=0; i < fieldCount; ++i) {
+      this.fieldNames = new String[fields.length];
+      for(int i=0; i < fields.length; ++i) {
         int subtype = type.getSubtypes(i);
-        if (included == null || included[subtype]) {
-          this.fields[i] = createTreeReader(path, subtype, types, included, conf);
-        }
         this.fieldNames[i] = type.getFieldNames(i);
       }
     }
@@ -1906,11 +1862,6 @@ class RecordReaderImpl implements RecordReader {
                      List<OrcProto.ColumnEncoding> encodings
                     ) throws IOException {
       super.startStripe(streams, encodings);
-      for(TreeReader field: fields) {
-        if (field != null) {
-          field.startStripe(streams, encodings);
-        }
-      }
     }
 
     @Override
@@ -1924,23 +1875,13 @@ class RecordReaderImpl implements RecordReader {
     }
   }
 
-  private static class UnionTreeReader extends TreeReader {
-    private final TreeReader[] fields;
+  private static class UnionTreeReader extends CompoundTreeReader {
     private RunLengthByteReader tags;
 
     UnionTreeReader(Path path, int columnId,
                     List<OrcProto.Type> types,
                     boolean[] included, Configuration conf) throws IOException {
-      super(path, columnId, conf);
-      OrcProto.Type type = types.get(columnId);
-      int fieldCount = type.getSubtypesCount();
-      this.fields = new TreeReader[fieldCount];
-      for(int i=0; i < fieldCount; ++i) {
-        int subtype = type.getSubtypes(i);
-        if (included == null || included[subtype]) {
-          this.fields[i] = createTreeReader(path, subtype, types, included, conf);
-        }
-      }
+      super(path, columnId, conf, types, included);
     }
 
     @Override
@@ -1983,11 +1924,6 @@ class RecordReaderImpl implements RecordReader {
       super.startStripe(streams, encodings);
       tags = new RunLengthByteReader(streams.get(new StreamName(columnId,
           OrcProto.Stream.Kind.DATA)));
-      for(TreeReader field: fields) {
-        if (field != null) {
-          field.startStripe(streams, encodings);
-        }
-      }
     }
 
     @Override
@@ -2003,24 +1939,20 @@ class RecordReaderImpl implements RecordReader {
     }
   }
 
-  private static class ListTreeReader extends TreeReader {
-    private final TreeReader elementReader;
+  private static class ListTreeReader extends CompoundTreeReader {
     private IntegerReader lengths = null;
 
     ListTreeReader(Path path, int columnId,
                    List<OrcProto.Type> types,
                    boolean[] included, Configuration conf) throws IOException {
-      super(path, columnId, conf);
-      OrcProto.Type type = types.get(columnId);
-      elementReader = createTreeReader(path, type.getSubtypes(0), types,
-          included, conf);
+      super(path, columnId, conf, types, included);
     }
 
     @Override
     void seek(PositionProvider[] index) throws IOException {
       super.seek(index);
       lengths.seek(index[columnId]);
-      elementReader.seek(index);
+      fields[0].seek(index);
     }
 
     @Override
@@ -2042,7 +1974,7 @@ class RecordReaderImpl implements RecordReader {
         }
         // read the new elements into the array
         for(int i=0; i< length; i++) {
-          result.set(i, elementReader.next(i < prevLength ?
+          result.set(i, fields[0].next(i < prevLength ?
               result.get(i) : null));
         }
         // remove any extra elements
@@ -2076,9 +2008,6 @@ class RecordReaderImpl implements RecordReader {
       lengths = createIntegerReader(encodings.get(columnId).getKind(),
           streams.get(new StreamName(columnId,
               OrcProto.Stream.Kind.LENGTH)), false);
-      if (elementReader != null) {
-        elementReader.startStripe(streams, encodings);
-      }
     }
 
     @Override
@@ -2088,41 +2017,26 @@ class RecordReaderImpl implements RecordReader {
       for(long i=0; i < items; ++i) {
         childSkip += lengths.next();
       }
-      elementReader.skipRows(childSkip);
+      fields[0].skipRows(childSkip);
     }
   }
 
-  private static class MapTreeReader extends TreeReader {
-    private final TreeReader keyReader;
-    private final TreeReader valueReader;
+  private static class MapTreeReader extends CompoundTreeReader {
     private IntegerReader lengths = null;
 
     MapTreeReader(Path path,
                   int columnId,
                   List<OrcProto.Type> types,
                   boolean[] included, Configuration conf) throws IOException {
-      super(path, columnId, conf);
-      OrcProto.Type type = types.get(columnId);
-      int keyColumn = type.getSubtypes(0);
-      int valueColumn = type.getSubtypes(1);
-      if (included == null || included[keyColumn]) {
-        keyReader = createTreeReader(path, keyColumn, types, included, conf);
-      } else {
-        keyReader = null;
-      }
-      if (included == null || included[valueColumn]) {
-        valueReader = createTreeReader(path, valueColumn, types, included, conf);
-      } else {
-        valueReader = null;
-      }
+      super(path, columnId, conf, types, included);
     }
 
     @Override
     void seek(PositionProvider[] index) throws IOException {
       super.seek(index);
       lengths.seek(index[columnId]);
-      keyReader.seek(index);
-      valueReader.seek(index);
+      fields[0].seek(index);
+      fields[1].seek(index);
     }
 
     @Override
@@ -2141,7 +2055,7 @@ class RecordReaderImpl implements RecordReader {
         int length = (int) lengths.next();
         // read the new elements into the array
         for(int i=0; i< length; i++) {
-          result.put(keyReader.next(null), valueReader.next(null));
+          result.put(fields[0].next(null), fields[1].next(null));
         }
       }
       return result;
@@ -2170,12 +2084,6 @@ class RecordReaderImpl implements RecordReader {
       lengths = createIntegerReader(encodings.get(columnId).getKind(),
           streams.get(new StreamName(columnId,
               OrcProto.Stream.Kind.LENGTH)), false);
-      if (keyReader != null) {
-        keyReader.startStripe(streams, encodings);
-      }
-      if (valueReader != null) {
-        valueReader.startStripe(streams, encodings);
-      }
     }
 
     @Override
@@ -2185,8 +2093,8 @@ class RecordReaderImpl implements RecordReader {
       for(long i=0; i < items; ++i) {
         childSkip += lengths.next();
       }
-      keyReader.skipRows(childSkip);
-      valueReader.skipRows(childSkip);
+      fields[1].skipRows(childSkip);
+      fields[1].skipRows(childSkip);
     }
   }
 
@@ -2194,7 +2102,8 @@ class RecordReaderImpl implements RecordReader {
                                              int columnId,
                                              List<OrcProto.Type> types,
                                              boolean[] included,
-                                             Configuration conf
+                                             Configuration conf,
+                                             OrcProto.ColumnEncoding encoding
                                             ) throws IOException {
     OrcProto.Type type = types.get(columnId);
     switch (type.getKind()) {
@@ -2213,17 +2122,51 @@ class RecordReaderImpl implements RecordReader {
       case LONG:
         return new LongTreeReader(path, columnId, conf);
       case STRING:
-        return new StringTreeReader(path, columnId, conf);
+        switch (encoding.getKind()) {
+          case DICTIONARY:
+          case DICTIONARY_V2:
+            return new StringDictionaryTreeReader(path, columnId, conf);
+          case DIRECT:
+          case DIRECT_V2:
+            return new StringDirectTreeReader(path, columnId, conf);
+          default:
+            throw new IllegalArgumentException("Bad string encoding " +
+                encoding.getKind());
+        }
       case CHAR:
         if (!type.hasMaximumLength()) {
           throw new IllegalArgumentException("ORC char type has no length specified");
         }
-        return new CharTreeReader(path, columnId, type.getMaximumLength(), conf);
+        switch (encoding.getKind()) {
+          case DICTIONARY:
+          case DICTIONARY_V2:
+            return new CharDictionaryTreeReader(path, columnId,
+                type.getMaximumLength(), conf);
+          case DIRECT:
+          case DIRECT_V2:
+            return new CharDirectTreeReader(path, columnId,
+                type.getMaximumLength(), conf);
+          default:
+            throw new IllegalArgumentException("Bad string encoding " +
+                encoding.getKind());
+        }
       case VARCHAR:
         if (!type.hasMaximumLength()) {
           throw new IllegalArgumentException("ORC varchar type has no length specified");
         }
-        return new VarcharTreeReader(path, columnId, type.getMaximumLength(), conf);
+        switch (encoding.getKind()) {
+          case DICTIONARY:
+          case DICTIONARY_V2:
+            return new VarcharDictionaryTreeReader(path, columnId,
+                type.getMaximumLength(), conf);
+          case DIRECT:
+          case DIRECT_V2:
+            return new VarcharDirectTreeReader(path, columnId,
+                type.getMaximumLength(), conf);
+          default:
+            throw new IllegalArgumentException("Bad string encoding " +
+                encoding.getKind());
+        }
       case BINARY:
         return new BinaryTreeReader(path, columnId, conf);
       case TIMESTAMP:
@@ -3017,8 +2960,9 @@ class RecordReaderImpl implements RecordReader {
           }
         }
         StreamName name = new StreamName(column, streamDesc.getKind());
-        streams.put(name, InStream.create(name.toString(), buffers, offsets,
-            length, codec, bufferSize));
+        InStream stream = InStream.create(name.toString(), buffers, offsets,
+            length, codec, bufferSize);
+        streams.put(name, stream);
       }
       offset += streamDesc.getLength();
     }
