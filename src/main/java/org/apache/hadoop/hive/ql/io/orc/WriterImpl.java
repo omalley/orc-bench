@@ -190,7 +190,8 @@ class WriterImpl implements Writer, MemoryManager.Callback {
     this.memoryManager = memoryManager;
     buildIndex = rowIndexStride > 0;
     codec = createCodec(compress);
-    this.bufferSize = getEstimatedBufferSize(bufferSize);
+    this.bufferSize = getEstimatedBufferSize(countColumns(inspector),
+        bufferSize);
     treeWriter = createTreeWriter(inspector, streamFactory, false);
     if (buildIndex && rowIndexStride < MIN_ROW_INDEX_STRIDE) {
       throw new IllegalArgumentException("Row stride must be at least " +
@@ -201,45 +202,58 @@ class WriterImpl implements Writer, MemoryManager.Callback {
     memoryManager.addWriter(path, stripeSize, this);
   }
 
-  int getEstimatedBufferSize(int bs) {
-    String colNames = conf.get(IOConstants.COLUMNS);
-    long availableMem = getMemoryAvailableForORC();
-    if (colNames != null) {
-      final int numCols = colNames.split(",").length;
-      if (numCols > COLUMN_COUNT_THRESHOLD) {
-        // In BufferedStream, there are 3 outstream buffers (compressed,
-        // uncompressed and overflow) and list of previously compressed buffers.
-        // Since overflow buffer is rarely used, lets consider only 2 allocation.
-        // Also, initially, the list of compression buffers will be empty.
-        final int outStreamBuffers = codec == null ? 1 : 2;
-
-        // max possible streams per column is 5. For string columns, there is
-        // ROW_INDEX, PRESENT, DATA, LENGTH, DICTIONARY_DATA streams.
-        final int maxStreams = 5;
-
-        // Lets assume 10% memory for holding dictionary in memory and other
-        // object allocations
-        final long miscAllocation = (long) (0.1f * availableMem);
-
-        // compute the available memory
-        final long remainingMem = availableMem - miscAllocation;
-
-        int estBufferSize = (int) (remainingMem /
-            (maxStreams * outStreamBuffers * numCols));
-        estBufferSize = getClosestBufferSize(estBufferSize, bs);
-        if (estBufferSize > bs) {
-          estBufferSize = bs;
+  static int countColumns(ObjectInspector oi) {
+    switch (oi.getCategory()) {
+      case PRIMITIVE:
+        return 1;
+      case STRUCT: {
+        int result = 1;
+        for(StructField field:
+            ((StructObjectInspector) oi).getAllStructFieldRefs()) {
+          result += countColumns(field.getFieldObjectInspector());
         }
-
-        LOG.info("WIDE TABLE - Number of columns: " + numCols +
-            " Chosen compression buffer size: " + estBufferSize);
-        return estBufferSize;
+        return result;
       }
+      case UNION: {
+        int result = 1;
+        for(ObjectInspector child:
+            ((UnionObjectInspector) oi).getObjectInspectors()) {
+          result += countColumns(child);
+        }
+        return result;
+      }
+      case LIST:
+        return 1 + countColumns(
+            ((ListObjectInspector)oi).getListElementObjectInspector());
+      case MAP: {
+        MapObjectInspector moi = (MapObjectInspector) oi;
+        return 1 + countColumns(moi.getMapKeyObjectInspector()) +
+            countColumns(moi.getMapValueObjectInspector());
+      }
+      default:
+        throw new IllegalArgumentException("Unknown category " +
+            oi.getCategory());
     }
-    return bs;
   }
 
-  private int getClosestBufferSize(int estBufferSize, int bs) {
+  int getEstimatedBufferSize(int numColumns, int bs) {
+
+    // The worst case is that there are 2 big streams per a column and
+    // we want to guarantee that each stream gets ~10 buffers.
+    // This keeps buffers small enough that we don't get really small stripe
+    // sizes.
+    int estBufferSize = (int) (defaultStripeSize / (20 * numColumns));
+    estBufferSize = getClosestBufferSize(estBufferSize);
+    if (estBufferSize > bs) {
+      estBufferSize = bs;
+    } else {
+      LOG.info("WIDE TABLE - Number of columns: " + numColumns +
+          " Chosen compression buffer size: " + estBufferSize);
+    }
+    return estBufferSize;
+  }
+
+  private int getClosestBufferSize(int estBufferSize) {
     final int kb4 = 4 * 1024;
     final int kb8 = 8 * 1024;
     final int kb16 = 16 * 1024;
@@ -262,16 +276,6 @@ class WriterImpl implements Writer, MemoryManager.Callback {
     } else {
       return kb256;
     }
-  }
-
-  // the assumption is only one ORC writer open at a time, which holds true for
-  // most of the cases. HIVE-6455 forces single writer case.
-  private long getMemoryAvailableForORC() {
-    HiveConf.ConfVars poolVar = HiveConf.ConfVars.HIVE_ORC_FILE_MEMORY_POOL;
-    double maxLoad = conf.getFloat(poolVar.varname, poolVar.defaultFloatVal);
-    long totalMemoryPool = Math.round(ManagementFactory.getMemoryMXBean().
-        getHeapMemoryUsage().getMax() * maxLoad);
-    return totalMemoryPool;
   }
 
   static CompressionCodec createCodec(CompressionKind kind) {
